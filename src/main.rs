@@ -39,7 +39,9 @@ fn get_file_path() -> Result<PathBuf> {
 }
 
 async fn get_data() -> Json<Value> {
+    println!("GET /api/data requested");
     if let Ok(file_path) = get_file_path() {
+        println!("Reading from: {:?}", file_path);
         if let Ok(content) = fs::read_to_string(&file_path) {
             if let Ok(data) = serde_json::from_str(&content) {
                 return Json(data);
@@ -47,28 +49,43 @@ async fn get_data() -> Json<Value> {
         }
     }
     
+    println!("Returning default schema");
     // Default schema structure
     let default_data = serde_json::json!({
         "tasks": [],
         "contexts": [
-            { "id": "work", "name": "Work", "position": 1 },
-            { "id": "school", "name": "School", "position": 2 },
-            { "id": "projects", "name": "Projects", "position": 3 }
+            { "id": "work", "name": "Work", "position": 0 },
+            { "id": "school", "name": "School", "position": 1 },
+            { "id": "projects", "name": "Projects", "position": 2 }
         ],
         "columns": [
-            { "id": "todo", "name": "To Do", "position": 1 },
-            { "id": "doing", "name": "Doing", "position": 2 },
-            { "id": "done", "name": "Done", "position": 3 }
+            { "id": "todo", "name": "To Do", "position": 0 },
+            { "id": "doing", "name": "Doing", "position": 1 },
+            { "id": "done", "name": "Done", "position": 2 }
         ]
     });
     
     Json(default_data)
 }
 
-async fn save_data(Json(payload): Json<Value>) {
+async fn save_data(Json(payload): Json<Value>) -> axum::http::StatusCode {
+    println!("PUT /api/data received");
     if let Ok(file_path) = get_file_path() {
         if let Ok(content) = serde_json::to_string_pretty(&payload) {
-            let _ = fs::write(&file_path, content);
+            match fs::write(&file_path, content) {
+                Ok(_) => {
+                    println!("Successfully saved data to {:?}", file_path);
+                    axum::http::StatusCode::OK
+                },
+                Err(e) => {
+                    eprintln!("Failed to write to file {:?}: {}", file_path, e);
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        } else {
+            axum::http::StatusCode::BAD_REQUEST
         }
+    } else {
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
     }
 }
