@@ -27,7 +27,17 @@ sudo ufw allow in on tailscale0 to any port 3001
 
 ## Persistent Setup (systemd)
 
-To keep the server running continuously and securely, create a service file at `/etc/systemd/system/tohdohboard-server.service`:
+For a stable and secure production setup, it is recommended to run the server as a `systemd` service.
+
+### 1. Build the Binary
+First, compile the production-ready binary:
+```bash
+cd tohdohboard-backend
+cargo build --release
+```
+
+### 2. Configure the Service
+Create a service file at `/etc/systemd/system/tohdohboard-server.service`:
 
 ```ini
 [Unit]
@@ -38,13 +48,13 @@ After=network.target
 Type=simple
 User=your-username
 # Replace with the actual absolute path to your backend directory
-WorkingDirectory=/home/your-username/tohdohboard-backend
-ExecStart=/usr/bin/cargo run --release
+WorkingDirectory=/home/your-username/Applications/tohdohboard-backend
+# Point directly to the binary to avoid build overhead or permission issues
+ExecStart=/home/your-username/Applications/tohdohboard-backend/target/release/tohdohboard-server
 Restart=always
 
 # Security Hardening
-# Limits the "blast radius" by restricting filesystem access
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=/home/your-username/.tohdohboard
 PrivateTmp=true
@@ -54,9 +64,17 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-Then run:
+### 3. Permissions & Startup
+Ensure your user owns the config directory:
+```bash
+sudo chown -R your-username:your-username ~/.tohdohboard
+```
+
+Enable and start the service:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable tohdohboard-server
 sudo systemctl start tohdohboard-server
 ```
+
+*Note: If you update the code via git pull, you must rebuild with `cargo build --release` and then run `sudo systemctl restart tohdohboard-server`.*
