@@ -8,11 +8,23 @@
 //! * `proxy`: a trusted reverse proxy (Tailscale Serve, oauth2-proxy, ...)
 //!   puts the user id in `user_header`. The value is treated as an opaque id
 //!   and mapped to `data_dir/users/<sanitized id>` by [`sanitize_user`].
+//!   Requests *without* the header may authenticate with a bearer token if
+//!   `[auth.tokens]` is not empty (e.g. public traffic via Tailscale Funnel,
+//!   which carries no identity header).
+//! * `token`: `Authorization: Bearer <token>`. The token's SHA-256 is compared
+//!   in constant time with every entry of `[auth.tokens]` ([`Tokens`]); the
+//!   matching entry's key is the user id.
+//!
+//! Failures answer `401`, with `WWW-Authenticate: Bearer` whenever a token
+//! would be accepted.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use crate::AppState;
 use crate::config::AuthMode;
@@ -30,11 +42,91 @@ pub enum User {
 
 /// Rejection for unauthenticated requests: `401 Unauthorized`.
 #[derive(Debug)]
-pub struct AuthError;
+pub struct AuthError {
+    /// Whether a bearer token would have been accepted, which adds a
+    /// `WWW-Authenticate: Bearer` challenge.
+    bearer: bool,
+}
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response()
+        let mut res = (StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
+        if self.bearer {
+            res.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"tohdohboard\""),
+            );
+        }
+        res
+    }
+}
+
+/// SHA-256 of a bearer token, parsed from 64 hex digits in the config.
+#[derive(Clone, PartialEq, Eq, Hash, Deserialize)]
+#[serde(try_from = "String")]
+pub struct TokenHash([u8; 32]);
+
+impl TokenHash {
+    /// Hashes a token.
+    pub fn of(token: &str) -> Self {
+        Self(Sha256::digest(token.as_bytes()).into())
+    }
+}
+
+impl TryFrom<String> for TokenHash {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Self, String> {
+        let bytes = s.as_bytes();
+        let mut out = [0; 32];
+        let digit = |b: u8| char::from(b).to_digit(16);
+        if bytes.len() != 64 {
+            return Err("expected a SHA-256 as 64 hex digits (see `hash-token`)".to_owned());
+        }
+        for (o, pair) in out.iter_mut().zip(bytes.chunks(2)) {
+            match (digit(pair[0]), digit(pair[1])) {
+                (Some(hi), Some(lo)) => *o = (hi * 16 + lo) as u8,
+                _ => {
+                    return Err("expected a SHA-256 as 64 hex digits (see `hash-token`)".to_owned());
+                }
+            }
+        }
+        Ok(Self(out))
+    }
+}
+
+impl std::fmt::Display for TokenHash {
+    /// Lowercase hex, as `hash-token` prints it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+impl std::fmt::Debug for TokenHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenHash(..)")
+    }
+}
+
+/// A table of users and their token hashes.
+#[derive(Debug)]
+pub struct Tokens<'a>(pub &'a std::collections::BTreeMap<String, TokenHash>);
+
+impl Tokens<'_> {
+    /// Returns the user whose token this is.
+    ///
+    /// Every entry is compared, in constant time, so the response time does
+    /// not reveal how much of a hash matched or how many users there are
+    /// before the match.
+    pub fn verify(&self, token: &str) -> Option<&str> {
+        let presented = TokenHash::of(token);
+        let mut found = None;
+        for (user, hash) in self.0 {
+            if bool::from(hash.0.ct_eq(&presented.0)) {
+                found = Some(user.as_str());
+            }
+        }
+        found
     }
 }
 
@@ -45,10 +137,43 @@ impl IntoResponse for AuthError {
 /// [`AuthError`] if the request carries no acceptable identity.
 pub fn authenticate(parts: &Parts, state: &AppState) -> Result<User, AuthError> {
     let auth = &state.config.auth;
+    let tokens = Tokens(&auth.tokens);
+    let by_token = || {
+        bearer_token(&parts.headers)
+            .and_then(|t| tokens.verify(t))
+            .and_then(|u| sanitize_user(u.as_bytes()))
+            .map(User::Named)
+            .ok_or(AuthError { bearer: true })
+    };
+    // Funnel traffic is public: never let it claim an identity by header,
+    // even if a client managed to smuggle one past the proxy.
+    let funnel = parts.headers.contains_key(FUNNEL_HEADER);
     match auth.mode {
         AuthMode::None => Ok(User::Anonymous),
-        AuthMode::Proxy => proxy_user(&parts.headers, &auth.user_header).ok_or(AuthError),
+        AuthMode::Token => by_token(),
+        AuthMode::Proxy if !funnel && parts.headers.contains_key(auth.user_header.as_str()) => {
+            proxy_user(&parts.headers, &auth.user_header).ok_or(AuthError { bearer: false })
+        }
+        AuthMode::Proxy if !auth.tokens.is_empty() => by_token(),
+        AuthMode::Proxy => Err(AuthError { bearer: false }),
     }
+}
+
+/// Header that `tailscale serve` sets (to `?1`) on requests that arrived via
+/// Funnel, i.e. from the public internet; it deletes any client-sent copy.
+/// In proxy mode such requests never authenticate by `user_header`.
+pub const FUNNEL_HEADER: &str = "tailscale-funnel-request";
+
+/// Extracts the token from a single `Authorization: Bearer <token>` header.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(header::AUTHORIZATION).iter();
+    let value = values.next()?.to_str().ok()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let (scheme, token) = value.split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
 }
 
 /// Reads the user id from the proxy's header.
@@ -155,6 +280,49 @@ mod tests {
         assert!(sanitize_user(&[b'a'; 255]).is_some());
         assert_eq!(sanitize_user(&[b'a'; 256]), None);
         assert_eq!(sanitize_user(&[b'A'; 86]), None);
+    }
+
+    #[test]
+    fn token_hash_parses_hex_and_round_trips() {
+        let hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let h = TokenHash::try_from(hex.to_uppercase()).unwrap();
+        assert_eq!(h, TokenHash::of("test"));
+        assert_eq!(h.to_string(), hex);
+        assert!(TokenHash::try_from(hex[..62].to_owned()).is_err());
+        assert!(TokenHash::try_from(format!("{}zz", &hex[..62])).is_err());
+        assert!(TokenHash::try_from(format!("{}\u{e9}", &hex[..62])).is_err());
+        assert!(!format!("{h:?}").contains("9f86"));
+    }
+
+    #[test]
+    fn verifies_tokens() {
+        let table = [("alice", "a-secret"), ("bob", "b-secret")]
+            .into_iter()
+            .map(|(u, t)| (u.to_owned(), TokenHash::of(t)))
+            .collect();
+        let tokens = Tokens(&table);
+        assert_eq!(tokens.verify("a-secret"), Some("alice"));
+        assert_eq!(tokens.verify("b-secret"), Some("bob"));
+        assert_eq!(tokens.verify("a-secre"), None);
+        assert_eq!(tokens.verify(""), None);
+    }
+
+    #[test]
+    fn parses_bearer_header() {
+        let h = |vals: &[&str]| {
+            let mut m = HeaderMap::new();
+            for v in vals {
+                m.append(header::AUTHORIZATION, v.parse().unwrap());
+            }
+            m
+        };
+        assert_eq!(bearer_token(&h(&["Bearer abc"])), Some("abc"));
+        assert_eq!(bearer_token(&h(&["bearer  abc "])), Some("abc"));
+        assert_eq!(bearer_token(&h(&["Basic abc"])), None);
+        assert_eq!(bearer_token(&h(&["Bearer"])), None);
+        assert_eq!(bearer_token(&h(&["Bearer "])), None);
+        assert_eq!(bearer_token(&h(&["Bearer abc", "Bearer def"])), None);
+        assert_eq!(bearer_token(&h(&[])), None);
     }
 
     #[test]

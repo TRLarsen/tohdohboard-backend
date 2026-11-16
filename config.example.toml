@@ -33,7 +33,10 @@ delete_after_days = 0
 # "none":  no authentication; everyone shares the board in data_dir.
 # "proxy": a trusted reverse proxy (e.g. `tailscale serve`) sends the user's
 #          identity in user_header; each user gets data_dir/users/<user>/.
-#          Requests without the header get 401.
+#          Requests without the header get 401, unless [auth.tokens] is set:
+#          then they may use a bearer token instead (e.g. via Funnel).
+# "token": clients send `Authorization: Bearer <token>`; the token's SHA-256
+#          must be in [auth.tokens]. Each user gets data_dir/users/<user>/.
 mode = "none"
 
 # Proxy mode: header carrying the user id.
@@ -44,3 +47,19 @@ user_header = "Tailscale-User-Login"
 # Set this to true only if nothing but the proxy can reach the port, e.g. in a
 # container whose port is published on 127.0.0.1 only.
 allow_non_loopback = false
+
+# Browser origins allowed to call the API cross-origin (exact, lowercase, no
+# wildcards), e.g. ["https://board.example.ts.net", "tauri://localhost"].
+# Empty: any origin in mode "none", same-origin only in the other modes.
+# In proxy mode a listed origin's pages act with the identity of whoever opens
+# them in their browser, so keep this empty there unless you need it.
+cors_origins = []
+
+# User id -> SHA-256 (hex) of that user's token. Create one with
+#   TOKEN=$(openssl rand -hex 32)
+#   printf %s "$TOKEN" | tohdohboard-server hash-token
+# In proxy mode use exactly the id the proxy's header carries (e.g. the
+# Tailscale login; ids are case-sensitive) so token and header requests share
+# one board. Not allowed in mode "none"; every token must be unique.
+[auth.tokens]
+# "alice@example.com" = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"

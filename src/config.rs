@@ -8,11 +8,14 @@
 //! typos do not silently fall back to defaults. `config.example.toml` in the
 //! repository documents every key.
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+use crate::auth::{TokenHash, sanitize_user};
 
 /// Environment variable that overrides the config file location.
 pub const CONFIG_ENV: &str = "TOHDOH_CONFIG";
@@ -57,8 +60,12 @@ pub enum AuthMode {
     #[default]
     None,
     /// A trusted reverse proxy names the user in `user_header`; each user
-    /// gets a board in `data_dir/users/<user>`.
+    /// gets a board in `data_dir/users/<user>`. If `[auth.tokens]` is not
+    /// empty, requests without the header may use a bearer token instead.
     Proxy,
+    /// `Authorization: Bearer <token>`, checked against `[auth.tokens]`; each
+    /// user gets a board in `data_dir/users/<user>`.
+    Token,
 }
 
 /// The `[auth]` table.
@@ -72,6 +79,12 @@ pub struct AuthConfig {
     /// Proxy mode: allow a non-loopback `bind`. Only safe if nothing but the
     /// proxy can reach the server (e.g. a container network).
     pub allow_non_loopback: bool,
+    /// Origins allowed to call the API from a browser (CORS), matched
+    /// exactly, e.g. `https://board.example.ts.net` or `tauri://localhost`.
+    /// Empty means any origin in mode `none` and same-origin only otherwise.
+    pub cors_origins: Vec<String>,
+    /// User id to SHA-256 (hex) of that user's bearer token.
+    pub tokens: BTreeMap<String, TokenHash>,
 }
 
 impl Default for AuthConfig {
@@ -80,6 +93,8 @@ impl Default for AuthConfig {
             mode: AuthMode::None,
             user_header: "Tailscale-User-Login".to_owned(),
             allow_non_loopback: false,
+            cors_origins: Vec::new(),
+            tokens: BTreeMap::new(),
         }
     }
 }
@@ -115,7 +130,17 @@ impl Config {
     /// combination of settings (see [`Config::validate`]), or when `~` is used
     /// but the home directory cannot be determined.
     pub fn from_toml(text: &str) -> Result<Self> {
-        let mut config: Config = toml::from_str(text)?;
+        // Report only the position, not toml's quote of the offending line:
+        // that may be a token pasted by mistake where its hash belongs.
+        let mut config: Config = toml::from_str(text).map_err(|e| {
+            let msg = e.message().trim_end();
+            match e.span() {
+                Some(s) => {
+                    anyhow::anyhow!("line {}: {msg}", text[..s.start].matches('\n').count() + 1)
+                }
+                None => anyhow::anyhow!("{msg}"),
+            }
+        })?;
         config.data_dir = expand_tilde(&config.data_dir)?;
         config.validate()?;
         Ok(config)
@@ -126,12 +151,53 @@ impl Config {
     /// In proxy mode the identity header is only trustworthy if every request
     /// passes the proxy, so `bind` must be a loopback address unless
     /// `allow_non_loopback` is set, and `user_header` must not be one that
-    /// clients or the HTTP layer set ([`UNSAFE_USER_HEADERS`]).
+    /// clients or the HTTP layer set ([`UNSAFE_USER_HEADERS`]). Token mode
+    /// needs at least one token, token user ids must be usable as directory
+    /// names, and CORS origins must be exact origins.
     ///
     /// # Errors
     ///
     /// Describes the first problem found.
     pub fn validate(&self) -> Result<()> {
+        if self.auth.mode == AuthMode::Token && self.auth.tokens.is_empty() {
+            anyhow::bail!("auth.mode = \"token\" needs at least one entry in [auth.tokens]");
+        }
+        let tables = [("auth.tokens", &self.auth.tokens)];
+        if self.auth.mode == AuthMode::None
+            && let Some((table, _)) = tables.iter().find(|(_, t)| !t.is_empty())
+        {
+            anyhow::bail!(
+                "[{table}] has entries but auth.mode = \"none\" would ignore them; \
+                 set mode = \"token\" or \"proxy\""
+            );
+        }
+        let mut seen = HashMap::new();
+        for (table, map) in tables {
+            for (user, hash) in map {
+                if sanitize_user(user.as_bytes()).is_none() {
+                    anyhow::bail!("[{table}]: user id {user:?} is empty or too long");
+                }
+                if let Some((t, u)) = seen.insert(hash, (table, user)) {
+                    anyhow::bail!(
+                        "[{t}] {u:?} and [{table}] {user:?} have the same token hash; \
+                         every token must be unique"
+                    );
+                }
+            }
+        }
+        for origin in &self.auth.cors_origins {
+            let valid = origin.split_once("://").is_some_and(|(scheme, host)| {
+                !scheme.is_empty() && !host.is_empty() && !host.contains(['/', '*', '?', '#', '@'])
+            }) && !origin.bytes().any(|b| b.is_ascii_uppercase())
+                && axum::http::HeaderValue::from_str(origin).is_ok();
+            if !valid {
+                anyhow::bail!(
+                    "auth.cors_origins: {origin:?} is not an origin like \"https://host.example\" \
+                     (lowercase scheme and host, optional port, no path, query or trailing \
+                     slash, no wildcard)"
+                );
+            }
+        }
         if self.auth.mode == AuthMode::Proxy {
             let name = axum::http::HeaderName::try_from(self.auth.user_header.as_str())
                 .with_context(|| {
@@ -295,6 +361,63 @@ mod tests {
             assert!(Config::from_toml(&text).is_err(), "{unsafe_header}");
         }
         assert!(Config::from_toml("[auth]\nmode = \"magic\"\n").is_err());
+    }
+
+    #[test]
+    fn token_mode_settings() {
+        let hash = "9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08";
+        let c = Config::from_toml(&format!(
+            "[auth]\nmode = \"token\"\ncors_origins = [\"tauri://localhost\"]\n[auth.tokens]\n\"alice@x\" = \"{hash}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(c.auth.mode, AuthMode::Token);
+        assert!(c.auth.tokens.contains_key("alice@x"));
+        assert_eq!(c.auth.cors_origins, ["tauri://localhost"]);
+
+        assert!(Config::from_toml("[auth]\nmode = \"token\"\n").is_err());
+        assert!(Config::from_toml("[auth.tokens]\nbob = \"abc\"\n").is_err());
+        let token_mode = "[auth]\nmode = \"token\"\n[auth.tokens]\n";
+        assert!(Config::from_toml(&format!("{token_mode}\"\" = \"{hash}\"\n")).is_err());
+        for bad in [
+            "*",
+            "https://x.example/",
+            "x.example",
+            "https://x.example/path",
+            "https://X.example",
+            "HTTPS://x.example",
+            "https://x.example?q",
+        ] {
+            let text = format!("[auth]\ncors_origins = [{bad:?}]\n");
+            assert!(Config::from_toml(&text).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn rejects_ignored_or_ambiguous_tokens() {
+        let (a, b) = (TokenHash::of("a"), TokenHash::of("b"));
+        let err = Config::from_toml(&format!("[auth.tokens]\nalice = \"{a}\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\"none\""), "{err}");
+        let token_mode = "[auth]\nmode = \"token\"\n[auth.tokens]\n";
+        assert!(
+            Config::from_toml(&format!("{token_mode}alice = \"{a}\"\nbob = \"{b}\"\n")).is_ok()
+        );
+        let err = Config::from_toml(&format!("{token_mode}alice = \"{a}\"\nbob = \"{a}\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same token hash"), "{err}");
+    }
+
+    #[test]
+    fn config_errors_do_not_echo_values() {
+        let text = "[auth]\nmode = \"token\"\n[auth.tokens]\nalice = \"my-plaintext-token\"\n";
+        let err = format!("{:#}", Config::from_toml(text).unwrap_err());
+        assert!(!err.contains("my-plaintext-token"), "{err}");
+        assert!(
+            err.contains("line 4") && err.contains("64 hex digits"),
+            "{err}"
+        );
     }
 
     #[test]

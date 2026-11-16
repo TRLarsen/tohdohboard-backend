@@ -1,7 +1,7 @@
 //! HTTP handlers and the [`router`] that wires them up.
 
-use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -9,34 +9,62 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::AppState;
 use crate::archive;
-use crate::config::AuthMode;
+use crate::config::{AuthConfig, AuthMode};
 use crate::store::Board;
 
-/// Builds the application: all routes, CORS and request logging.
-///
-/// CORS allows any origin in auth mode `none` (the historic behaviour). With
-/// authentication enabled no CORS headers are sent, so only same-origin
-/// clients (e.g. the web UI behind the same proxy) can read responses.
+/// Largest accepted request body, in bytes. Bodies are only read after
+/// authentication succeeded.
+pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Builds the application: all routes, CORS, the body size limit and request
+/// logging.
 pub fn router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/api/data", get(get_data).put(put_data))
         .route("/api/archive", get(get_archive).post(post_archive))
         .route("/api/archive/restore", post(post_restore));
-    if state.config.auth.mode == AuthMode::None {
-        api = api.layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([Method::GET, Method::PUT, Method::POST])
-                .allow_headers(Any),
-        );
+    if let Some(cors) = cors_layer(&state.config.auth) {
+        api = api.layer(cors);
     }
     api.route("/healthz", get(healthz))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(middleware::from_fn(log_request))
         .with_state(state)
+}
+
+/// The CORS policy.
+///
+/// With `cors_origins` set, exactly those origins may call the API, sending
+/// `Authorization` and `Content-Type`. Without it, any origin may in mode
+/// `none` (the historic behaviour), and no CORS headers are sent otherwise,
+/// so only same-origin clients (e.g. the web UI behind the same proxy) can
+/// read responses.
+fn cors_layer(auth: &AuthConfig) -> Option<CorsLayer> {
+    let methods = [Method::GET, Method::PUT, Method::POST];
+    if !auth.cors_origins.is_empty() {
+        // Validated in `Config::validate`.
+        let origins = auth
+            .cors_origins
+            .iter()
+            .filter_map(|o| HeaderValue::from_str(o).ok());
+        return Some(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(origins))
+                .allow_methods(methods)
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+                .expose_headers([header::WWW_AUTHENTICATE]),
+        );
+    }
+    (auth.mode == AuthMode::None).then(|| {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(methods)
+            .allow_headers(Any)
+    })
 }
 
 /// Logs one line per request to stderr: method, path, status, duration.

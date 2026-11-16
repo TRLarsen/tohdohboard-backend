@@ -19,7 +19,7 @@
 //!
 //! By default there is no authentication, and CORS allows any origin, so run
 //! it only on a trusted network such as a tailnet. With `[auth] mode =
-//! "proxy"` each user gets their own board ([`auth`]).
+//! "proxy"` or `"token"` each user gets their own board ([`auth`]).
 //!
 //! # Modules
 //!
