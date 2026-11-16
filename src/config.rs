@@ -85,6 +85,9 @@ pub struct AuthConfig {
     pub cors_origins: Vec<String>,
     /// User id to SHA-256 (hex) of that user's bearer token.
     pub tokens: BTreeMap<String, TokenHash>,
+    /// User id to SHA-256 (hex) of a token that only opens that user's
+    /// calendar feed, so a leaked feed URL does not expose the board.
+    pub feed_tokens: BTreeMap<String, TokenHash>,
 }
 
 impl Default for AuthConfig {
@@ -95,6 +98,7 @@ impl Default for AuthConfig {
             allow_non_loopback: false,
             cors_origins: Vec::new(),
             tokens: BTreeMap::new(),
+            feed_tokens: BTreeMap::new(),
         }
     }
 }
@@ -162,7 +166,10 @@ impl Config {
         if self.auth.mode == AuthMode::Token && self.auth.tokens.is_empty() {
             anyhow::bail!("auth.mode = \"token\" needs at least one entry in [auth.tokens]");
         }
-        let tables = [("auth.tokens", &self.auth.tokens)];
+        let tables = [
+            ("auth.tokens", &self.auth.tokens),
+            ("auth.feed_tokens", &self.auth.feed_tokens),
+        ];
         if self.auth.mode == AuthMode::None
             && let Some((table, _)) = tables.iter().find(|(_, t)| !t.is_empty())
         {
@@ -404,6 +411,16 @@ mod tests {
             Config::from_toml(&format!("{token_mode}alice = \"{a}\"\nbob = \"{b}\"\n")).is_ok()
         );
         let err = Config::from_toml(&format!("{token_mode}alice = \"{a}\"\nbob = \"{a}\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("same token hash"), "{err}");
+        // Feed tokens: also ignored in mode "none", and a feed token equal to
+        // a full token would open the board.
+        let feed = format!("[auth.feed_tokens]\nalice = \"{b}\"\n");
+        assert!(Config::from_toml(&feed).is_err());
+        let ok = format!("{token_mode}alice = \"{a}\"\n{feed}");
+        assert!(Config::from_toml(&ok).is_ok());
+        let err = Config::from_toml(&format!("{token_mode}bob = \"{b}\"\n{feed}"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("same token hash"), "{err}");

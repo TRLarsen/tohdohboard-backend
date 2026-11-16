@@ -15,6 +15,8 @@
 //! * `GET /api/archive` returns `{ "tasks": [...] }`, newest archived first.
 //! * `POST /api/archive` and `POST /api/archive/restore` take
 //!   `{ "taskIds": [...] }` and move those tasks into or out of the archive.
+//! * `GET /api/calendar.ics` returns the due tasks as an iCalendar feed
+//!   ([`ics`]).
 //! * `GET /healthz` answers `ok`, without authentication.
 //!
 //! By default there is no authentication, and CORS allows any origin, so run
@@ -27,6 +29,7 @@
 //! * [`auth`]: who the user is, and so which board a request uses.
 //! * [`store`]: atomic, per-board-locked file storage.
 //! * [`archive`]: pure archive and sweep logic.
+//! * [`ics`]: the iCalendar writer.
 //! * [`routes`]: the HTTP handlers.
 
 #![warn(missing_docs)]
@@ -35,6 +38,7 @@
 pub mod archive;
 pub mod auth;
 pub mod config;
+pub mod ics;
 pub mod routes;
 pub mod store;
 
