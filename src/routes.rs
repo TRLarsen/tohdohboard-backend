@@ -1,7 +1,6 @@
 //! HTTP handlers and the [`router`] that wires them up.
 
-use axum::extract::{FromRequestParts, Request, State};
-use axum::http::request::Parts;
+use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -14,36 +13,49 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::AppState;
 use crate::archive;
+use crate::config::AuthMode;
 use crate::store::Board;
 
 /// Builds the application: all routes, CORS and request logging.
+///
+/// CORS allows any origin in auth mode `none` (the historic behaviour). With
+/// authentication enabled no CORS headers are sent, so only same-origin
+/// clients (e.g. the web UI behind the same proxy) can read responses.
 pub fn router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::PUT, Method::POST])
-        .allow_headers(Any);
-    Router::new()
+    let mut api = Router::new()
         .route("/api/data", get(get_data).put(put_data))
         .route("/api/archive", get(get_archive).post(post_archive))
-        .route("/api/archive/restore", post(post_restore))
-        .layer(cors)
+        .route("/api/archive/restore", post(post_restore));
+    if state.config.auth.mode == AuthMode::None {
+        api = api.layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::PUT, Method::POST])
+                .allow_headers(Any),
+        );
+    }
+    api.route("/healthz", get(healthz))
         .layer(middleware::from_fn(log_request))
         .with_state(state)
 }
 
 /// Logs one line per request to stderr: method, path, status, duration.
 ///
-/// The query string is deliberately not logged.
+/// Health checks are not logged, and neither is the query string.
 async fn log_request(req: Request, next: Next) -> Response {
     let (method, path) = (req.method().clone(), req.uri().path().to_owned());
     let start = std::time::Instant::now();
     let res = next.run(req).await;
-    eprintln!(
-        "{method} {path} {} {}ms",
-        res.status().as_u16(),
-        start.elapsed().as_millis()
-    );
+    if path != "/healthz" {
+        let (status, ms) = (res.status().as_u16(), start.elapsed().as_millis());
+        eprintln!("{method} {path} {status} {ms}ms");
+    }
     res
+}
+
+/// `GET /healthz`: `200 ok`, unauthenticated, for container health checks.
+async fn healthz() -> &'static str {
+    "ok"
 }
 
 /// An internal error, answered with `500` and logged to stderr.
@@ -60,19 +72,6 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         eprintln!("error: {:#}", self.0);
         (StatusCode::INTERNAL_SERVER_ERROR, "internal error\n").into_response()
-    }
-}
-
-/// Every handler's board: the single board in `data_dir`.
-#[axum::async_trait]
-impl FromRequestParts<AppState> for Board {
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(
-        _parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(state.boards.board(state.config.data_dir.clone()))
     }
 }
 

@@ -28,6 +28,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Automatic archiving of finished tasks.
     pub archive: ArchiveConfig,
+    /// Who may use the server, and whose board they get.
+    pub auth: AuthConfig,
 }
 
 /// The `[archive]` table.
@@ -47,12 +49,48 @@ pub struct ArchiveConfig {
     pub delete_after_days: u32,
 }
 
+/// How requests are authenticated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// No authentication; everyone shares the board in `data_dir`.
+    #[default]
+    None,
+    /// A trusted reverse proxy names the user in `user_header`; each user
+    /// gets a board in `data_dir/users/<user>`.
+    Proxy,
+}
+
+/// The `[auth]` table.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    /// The authentication mode.
+    pub mode: AuthMode,
+    /// Proxy mode: the request header carrying the user id.
+    pub user_header: String,
+    /// Proxy mode: allow a non-loopback `bind`. Only safe if nothing but the
+    /// proxy can reach the server (e.g. a container network).
+    pub allow_non_loopback: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: AuthMode::None,
+            user_header: "Tailscale-User-Login".to_owned(),
+            allow_non_loopback: false,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             bind: SocketAddr::from(([0, 0, 0, 0], 3001)),
             data_dir: PathBuf::from("~/.tohdohboard"),
             archive: ArchiveConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -73,12 +111,53 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Fails on invalid TOML, unknown keys, wrongly typed values, or when `~`
-    /// is used but the home directory cannot be determined.
+    /// Fails on invalid TOML, unknown keys, wrongly typed values, an unsafe
+    /// combination of settings (see [`Config::validate`]), or when `~` is used
+    /// but the home directory cannot be determined.
     pub fn from_toml(text: &str) -> Result<Self> {
         let mut config: Config = toml::from_str(text)?;
         config.data_dir = expand_tilde(&config.data_dir)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// Rejects settings that would be unsafe or cannot work.
+    ///
+    /// In proxy mode the identity header is only trustworthy if every request
+    /// passes the proxy, so `bind` must be a loopback address unless
+    /// `allow_non_loopback` is set, and `user_header` must not be one that
+    /// clients or the HTTP layer set ([`UNSAFE_USER_HEADERS`]).
+    ///
+    /// # Errors
+    ///
+    /// Describes the first problem found.
+    pub fn validate(&self) -> Result<()> {
+        if self.auth.mode == AuthMode::Proxy {
+            let name = axum::http::HeaderName::try_from(self.auth.user_header.as_str())
+                .with_context(|| {
+                    format!(
+                        "auth.user_header {:?} is not a valid header name",
+                        self.auth.user_header
+                    )
+                })?;
+            if UNSAFE_USER_HEADERS.contains(&name.as_str()) {
+                anyhow::bail!(
+                    "auth.user_header {:?} is set by clients or the HTTP layer, not by an \
+                     identity proxy",
+                    self.auth.user_header
+                );
+            }
+            if !self.bind.ip().is_loopback() && !self.auth.allow_non_loopback {
+                anyhow::bail!(
+                    "auth.mode = \"proxy\" trusts the {} header, so bind must be a loopback address \
+                     (e.g. 127.0.0.1:3001), not {}; anyone reaching the port directly could forge it. \
+                     Set auth.allow_non_loopback = true only if just the proxy can reach the port.",
+                    self.auth.user_header,
+                    self.bind
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Loads the config from `path`; a missing file yields the defaults
@@ -104,6 +183,24 @@ impl Config {
         }
     }
 }
+
+/// Headers that can never carry a proxy-asserted identity: clients set them
+/// themselves, or they are hop-by-hop / framing headers. Lowercase.
+pub const UNSAFE_USER_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "host",
+    "origin",
+    "content-length",
+    "content-type",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "te",
+    "trailer",
+    "upgrade",
+];
 
 /// Returns the config file location, and whether it was chosen explicitly:
 /// `($TOHDOH_CONFIG, true)`, else `(<XDG config dir>/tohdohboard/config.toml,
@@ -179,6 +276,25 @@ mod tests {
         assert_eq!(c.bind.to_string(), "0.0.0.0:3001");
         let err = format!("{:#}", Config::load(&missing, true).unwrap_err());
         assert!(err.contains("nope.toml"), "{err}");
+    }
+
+    #[test]
+    fn proxy_mode_requires_loopback_unless_allowed() {
+        let base = "[auth]\nmode = \"proxy\"\n";
+        let err = Config::from_toml(base).unwrap_err().to_string();
+        assert!(err.contains("loopback"), "{err}");
+        let c = Config::from_toml(&format!("bind = \"127.0.0.1:3001\"\n{base}")).unwrap();
+        assert_eq!(c.auth.mode, AuthMode::Proxy);
+        assert_eq!(c.auth.user_header, "Tailscale-User-Login");
+        assert!(Config::from_toml(&format!("bind = \"[::1]:3001\"\n{base}")).is_ok());
+        assert!(Config::from_toml(&format!("{base}allow_non_loopback = true\n")).is_ok());
+        let bad_header = format!("bind = \"127.0.0.1:1\"\n{base}user_header = \"Bad Header\"\n");
+        assert!(Config::from_toml(&bad_header).is_err());
+        for unsafe_header in ["Authorization", "cookie", "Host", "Content-Length"] {
+            let text = format!("bind = \"127.0.0.1:1\"\n{base}user_header = {unsafe_header:?}\n");
+            assert!(Config::from_toml(&text).is_err(), "{unsafe_header}");
+        }
+        assert!(Config::from_toml("[auth]\nmode = \"magic\"\n").is_err());
     }
 
     #[test]

@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
     };
     eprintln!("config: {} ({status})", path.display());
     eprintln!("data dir: {}", config.data_dir.display());
+    eprintln!("auth: {:?}", config.auth.mode);
 
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
