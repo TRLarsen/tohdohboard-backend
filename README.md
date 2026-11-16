@@ -137,9 +137,77 @@ the port away from the network. The alternative is a Tailscale sidecar
 container sharing the server's network namespace. `GET /healthz` answers `ok`
 without authentication for health checks.
 
+## Access from outside the tailnet
+
+For access from the internet the server needs its own authentication, since
+public traffic carries no identity header. Use bearer tokens: each user has a
+random token, and the config stores only its SHA-256.
+
+```bash
+TOKEN=$(openssl rand -hex 32); echo "$TOKEN"   # give this to the user
+printf %s "$TOKEN" | tohdohboard-server hash-token   # put this in the config
+```
+
+```toml
+bind = "127.0.0.1:3001"
+[auth]
+mode = "proxy"            # tailnet users: identity header from tailscale serve
+[auth.tokens]             # everyone else: Authorization: Bearer <token>
+"alice@example.com" = "<sha256 from hash-token>"
+```
+
+Recommended setup for "tailnet users by identity, public users by token":
+one server in `proxy` mode with `[auth.tokens]` filled in. Requests that carry
+the identity header use it; requests without it must send a valid token. Key
+the tokens by exactly the login the header carries (ids are case-sensitive)
+and both paths open the same board. Expose the web UI twice with Tailscale,
+with the web UI itself listening on loopback only (see the trust boundary
+above):
+
+```bash
+(cd tohdohboard-web && npm start)                          # 127.0.0.1:3000
+tailscale serve  --bg --https=443  http://127.0.0.1:3000   # tailnet only
+tailscale funnel --bg --https=8443 http://127.0.0.1:3000   # public internet
+```
+
+If nobody needs the identity header, `mode = "token"` for everyone is simpler:
+then only tokens count, and the identity header is ignored. Do not run two
+servers on the same `data_dir`: locking is per process, so they would
+overwrite each other's changes.
+
+Facts and caveats:
+
+- Funnel serves public HTTPS on ports 443, 8443 and 10000 only, under your
+  `*.ts.net` name. Funnel itself does **no authentication** and adds no
+  identity headers. Whether a port is public (Funnel) or tailnet-only (Serve)
+  is decided per port.
+- The token fallback in proxy mode relies on the proxy stripping identity
+  headers sent by clients, for Funnel traffic too. `tailscale serve` does
+  this, and marks Funnel requests with `Tailscale-Funnel-Request: ?1` (both
+  verified in source, `addTailscaleIdentityHeaders` in `ipn/ipnlocal/serve.go`).
+  As a second line of defence, requests carrying that header never
+  authenticate by identity header, only by token. If you put another proxy in
+  front, check it strips identity headers, or use `mode = "token"`.
+- Failed authentication answers `401` with `WWW-Authenticate: Bearer`. Tokens
+  are compared in constant time. The server logs only method, path and status,
+  never headers or query strings. Request bodies are limited to 2 MiB and are
+  only read after authentication.
+- Use long random tokens (as above): the stored hash is a plain SHA-256,
+  which protects them but not a short password if the config file leaks.
+  Config errors never quote the offending value, in case a token was pasted
+  where its hash belongs. Every token must be unique.
+- Without TLS a token is readable on the wire. Funnel and Serve terminate
+  HTTPS; inside the tailnet WireGuard encrypts the traffic.
+- Browsers on other origins (e.g. a native shell at `tauri://localhost`) need
+  `cors_origins`. It is an exact allow-list and permits the `Authorization`
+  header. With it empty, only same-origin requests work outside mode `none`.
+  In proxy mode, leave it empty unless needed: a listed origin's pages can
+  act as any tailnet visitor who opens them (the browser adds the visitor's
+  identity on the way through `tailscale serve`).
+
 ## Security & Firewall Recommendations
 
-In the default mode TohdohBoard has no authentication. It is **highly recommended** to only run it within a trusted network like **Tailscale**, or to use proxy mode (above).
+In the default mode TohdohBoard has no authentication. It is **highly recommended** to only run it within a trusted network like **Tailscale**, or to use proxy or token mode (above).
 
 To block public access while allowing Tailnet traffic (using `ufw`):
 ```bash

@@ -13,6 +13,8 @@ dirs = "5.0"
 anyhow = "1.0"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+sha2 = "0.10"
+subtle = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
