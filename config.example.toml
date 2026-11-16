@@ -1,0 +1,30 @@
+# TohdohBoard server configuration.
+#
+# Location: $TOHDOH_CONFIG, else ~/.config/tohdohboard/config.toml
+# (the XDG config dir). Without a file at the XDG path, every key below has the
+# value shown; a file named by $TOHDOH_CONFIG must exist.
+# Unknown keys are an error, so typos are caught at startup.
+
+# Address and port to listen on.
+bind = "0.0.0.0:3001"
+
+# Directory holding data.json (the board) and archive.json.
+# A leading "~" is the home directory.
+data_dir = "~/.tohdohboard"
+
+[archive]
+# Archive finished tasks automatically when the board is loaded
+# (GET /api/data). Archiving by hand via the API works either way.
+enabled = true
+
+# Column id whose tasks count as finished.
+done_column = "done"
+
+# Finished tasks not updated for this many days move to the archive.
+# 0 archives them on the next load, including tasks restored from the archive
+# while still in the done column (move them to another column first).
+after_days = 14
+
+# Permanently delete archived tasks this many days after archiving.
+# 0 = never delete (deletion is opt-in).
+delete_after_days = 0

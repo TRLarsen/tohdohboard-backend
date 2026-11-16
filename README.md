@@ -13,6 +13,40 @@ cargo run
 
 By default, the server runs on `0.0.0.0:3001` and is accessible across your Tailnet.
 
+## Configuration
+
+Settings are read from a TOML file at `$TOHDOH_CONFIG`, or else
+`~/.config/tohdohboard/config.toml`. Without a file there the defaults apply:
+listen on `0.0.0.0:3001` and keep the board in `~/.tohdohboard/data.json`. A
+file named by `TOHDOH_CONFIG` must exist; the server refuses to start rather
+than fall back to the defaults. Every key is documented in
+[`config.example.toml`](config.example.toml); unknown keys are an error.
+
+```bash
+TOHDOH_CONFIG=./config.toml cargo run
+```
+
+If `data.json` or `archive.json` exists but is not valid JSON, the server
+answers `500` instead of serving an empty board, so no client overwrites the
+damaged file. Repair or move it aside to recover. Files are written atomically (temporary file + rename).
+
+## Archive
+
+Finished tasks are moved off the board into `archive.json` (next to
+`data.json`), which keeps the board small and every client uncluttered. When a
+client loads the board (`GET /api/data`), tasks in the `done` column that were
+not updated for 14 days are archived. Archived tasks are kept forever unless
+`delete_after_days` is set. See the `[archive]` section of the example config.
+
+| Route | Body | Response |
+|---|---|---|
+| `GET /api/archive` | | `{ "tasks": [...] }`, newest first; each task has `archivedAt` |
+| `POST /api/archive` | `{ "taskIds": ["..."] }` | `{ "archived": n }` |
+| `POST /api/archive/restore` | `{ "taskIds": ["..."] }` | `{ "restored": n }` |
+
+A `PUT /api/data` that still contains an archived task drops it, so a client
+with a stale copy cannot bring it back; restore it instead.
+
 ## Documentation
 
 The source is documented with Rustdoc, including private items. Build and open the docs with:
@@ -73,7 +107,7 @@ WantedBy=multi-user.target
 ```
 
 ### 3. Permissions & Startup
-Ensure your user owns the config directory:
+Ensure your user owns the data directory:
 ```bash
 sudo chown -R your-username:your-username ~/.tohdohboard
 ```
