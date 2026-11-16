@@ -28,3 +28,19 @@ after_days = 14
 # Permanently delete archived tasks this many days after archiving.
 # 0 = never delete (deletion is opt-in).
 delete_after_days = 0
+
+[auth]
+# "none":  no authentication; everyone shares the board in data_dir.
+# "proxy": a trusted reverse proxy (e.g. `tailscale serve`) sends the user's
+#          identity in user_header; each user gets data_dir/users/<user>/.
+#          Requests without the header get 401.
+mode = "none"
+
+# Proxy mode: header carrying the user id.
+user_header = "Tailscale-User-Login"
+
+# Proxy mode refuses to start unless bind is a loopback address (127.0.0.1 or
+# ::1), because anyone who can reach the port directly could forge the header.
+# Set this to true only if nothing but the proxy can reach the port, e.g. in a
+# container whose port is published on 127.0.0.1 only.
+allow_non_loopback = false

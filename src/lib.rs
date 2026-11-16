@@ -15,13 +15,16 @@
 //! * `GET /api/archive` returns `{ "tasks": [...] }`, newest archived first.
 //! * `POST /api/archive` and `POST /api/archive/restore` take
 //!   `{ "taskIds": [...] }` and move those tasks into or out of the archive.
+//! * `GET /healthz` answers `ok`, without authentication.
 //!
-//! There is no authentication, and CORS allows any origin, so run it only on a
-//! trusted network such as a tailnet.
+//! By default there is no authentication, and CORS allows any origin, so run
+//! it only on a trusted network such as a tailnet. With `[auth] mode =
+//! "proxy"` each user gets their own board ([`auth`]).
 //!
 //! # Modules
 //!
 //! * [`config`]: the TOML config file.
+//! * [`auth`]: who the user is, and so which board a request uses.
 //! * [`store`]: atomic, per-board-locked file storage.
 //! * [`archive`]: pure archive and sweep logic.
 //! * [`routes`]: the HTTP handlers.
@@ -30,11 +33,14 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 
 pub mod archive;
+pub mod auth;
 pub mod config;
 pub mod routes;
 pub mod store;
 
 use std::sync::Arc;
+
+use auth::User;
 
 pub use config::Config;
 pub use routes::router;
@@ -55,5 +61,15 @@ impl AppState {
             config: Arc::new(config),
             boards: Arc::default(),
         }
+    }
+
+    /// Returns the board of `user`: `data_dir` itself for
+    /// [`User::Anonymous`], else `data_dir/users/<user>`.
+    pub fn board_for(&self, user: &User) -> store::Board {
+        let dir = match user {
+            User::Anonymous => self.config.data_dir.clone(),
+            User::Named(name) => self.config.data_dir.join("users").join(name),
+        };
+        self.boards.board(dir)
     }
 }
