@@ -13,6 +13,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::AppState;
 use crate::archive;
+use crate::auth::FeedBoard;
 use crate::config::{AuthConfig, AuthMode};
 use crate::store::Board;
 
@@ -26,7 +27,8 @@ pub fn router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/api/data", get(get_data).put(put_data))
         .route("/api/archive", get(get_archive).post(post_archive))
-        .route("/api/archive/restore", post(post_restore));
+        .route("/api/archive/restore", post(post_restore))
+        .route("/api/calendar.ics", get(get_calendar));
     if let Some(cors) = cors_layer(&state.config.auth) {
         api = api.layer(cors);
     }
@@ -199,4 +201,21 @@ async fn post_restore(board: Board, Json(body): Json<TaskIds>) -> Result<Json<Va
         })
         .await?;
     Ok(Json(json!({ "restored": n })))
+}
+
+/// `GET /api/calendar.ics`: due tasks as an iCalendar feed ([`crate::ics`]).
+///
+/// Authenticated like the other routes, except that `?token=` and feed-only
+/// tokens are accepted too ([`FeedBoard`]).
+async fn get_calendar(
+    State(state): State<AppState>,
+    FeedBoard(board): FeedBoard,
+) -> Result<Response, AppError> {
+    let doc = board.with_files(|files| files.read_board()).await?;
+    let body = crate::ics::calendar(&doc, &state.config.archive.done_column, Utc::now());
+    let headers = [
+        (header::CONTENT_TYPE, "text/calendar; charset=utf-8"),
+        (header::CACHE_CONTROL, "private, no-cache"),
+    ];
+    Ok((headers, body).into_response())
 }

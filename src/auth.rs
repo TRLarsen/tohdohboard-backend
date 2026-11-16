@@ -17,8 +17,12 @@
 //!
 //! Failures answer `401`, with `WWW-Authenticate: Bearer` whenever a token
 //! would be accepted.
+//!
+//! The calendar feed uses [`FeedBoard`] instead, because calendar apps cannot
+//! send headers: wherever tokens are accepted it also takes `?token=`, and it
+//! also accepts the read-only tokens of `[auth.feed_tokens]`.
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, Query};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -112,13 +116,13 @@ impl std::fmt::Debug for TokenHash {
 #[derive(Debug)]
 pub struct Tokens<'a>(pub &'a std::collections::BTreeMap<String, TokenHash>);
 
-impl Tokens<'_> {
+impl<'a> Tokens<'a> {
     /// Returns the user whose token this is.
     ///
     /// Every entry is compared, in constant time, so the response time does
     /// not reveal how much of a hash matched or how many users there are
     /// before the match.
-    pub fn verify(&self, token: &str) -> Option<&str> {
+    pub fn verify(&self, token: &str) -> Option<&'a str> {
         let presented = TokenHash::of(token);
         let mut found = None;
         for (user, hash) in self.0 {
@@ -130,17 +134,48 @@ impl Tokens<'_> {
     }
 }
 
+/// What a request wants to reach, which decides the accepted credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// The board API: bearer tokens from `[auth.tokens]`.
+    Api,
+    /// The read-only calendar feed: additionally `?token=` and the tokens
+    /// from `[auth.feed_tokens]`.
+    Feed,
+}
+
+/// The `?token=` query parameter of the calendar feed.
+#[derive(Debug, Deserialize)]
+struct TokenQuery {
+    /// The presented token.
+    token: Option<String>,
+}
+
 /// Determines the user of a request according to the configured mode.
 ///
 /// # Errors
 ///
 /// [`AuthError`] if the request carries no acceptable identity.
-pub fn authenticate(parts: &Parts, state: &AppState) -> Result<User, AuthError> {
+pub fn authenticate(parts: &Parts, state: &AppState, scope: Scope) -> Result<User, AuthError> {
     let auth = &state.config.auth;
-    let tokens = Tokens(&auth.tokens);
+    let feed = scope == Scope::Feed;
     let by_token = || {
-        bearer_token(&parts.headers)
-            .and_then(|t| tokens.verify(t))
+        let query = || {
+            Query::<TokenQuery>::try_from_uri(&parts.uri)
+                .ok()
+                .and_then(|q| q.0.token)
+        };
+        let token = match bearer_token(&parts.headers) {
+            Some(t) => Some(t.to_owned()),
+            None if feed => query(),
+            None => None,
+        };
+        token
+            .as_deref()
+            .and_then(|t| {
+                let user = Tokens(&auth.tokens).verify(t);
+                user.or_else(|| feed.then(|| Tokens(&auth.feed_tokens).verify(t)).flatten())
+            })
             .and_then(|u| sanitize_user(u.as_bytes()))
             .map(User::Named)
             .ok_or(AuthError { bearer: true })
@@ -148,13 +183,14 @@ pub fn authenticate(parts: &Parts, state: &AppState) -> Result<User, AuthError> 
     // Funnel traffic is public: never let it claim an identity by header,
     // even if a client managed to smuggle one past the proxy.
     let funnel = parts.headers.contains_key(FUNNEL_HEADER);
+    let tokens_configured = !auth.tokens.is_empty() || (feed && !auth.feed_tokens.is_empty());
     match auth.mode {
         AuthMode::None => Ok(User::Anonymous),
         AuthMode::Token => by_token(),
         AuthMode::Proxy if !funnel && parts.headers.contains_key(auth.user_header.as_str()) => {
             proxy_user(&parts.headers, &auth.user_header).ok_or(AuthError { bearer: false })
         }
-        AuthMode::Proxy if !auth.tokens.is_empty() => by_token(),
+        AuthMode::Proxy if tokens_configured => by_token(),
         AuthMode::Proxy => Err(AuthError { bearer: false }),
     }
 }
@@ -224,8 +260,26 @@ impl FromRequestParts<AppState> for Board {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let user = authenticate(parts, state)?;
+        let user = authenticate(parts, state, Scope::Api)?;
         Ok(state.board_for(&user))
+    }
+}
+
+/// The board of the authenticated user, for the read-only calendar feed
+/// ([`Scope::Feed`]).
+#[derive(Debug)]
+pub struct FeedBoard(pub Board);
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for FeedBoard {
+    type Rejection = AuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let user = authenticate(parts, state, Scope::Feed)?;
+        Ok(Self(state.board_for(&user)))
     }
 }
 

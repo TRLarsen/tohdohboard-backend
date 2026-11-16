@@ -205,6 +205,40 @@ Facts and caveats:
   act as any tailnet visitor who opens them (the browser adds the visitor's
   identity on the way through `tailscale serve`).
 
+## Calendar feed (Google Calendar & others)
+
+`GET /api/calendar.ics` serves the board as an iCalendar feed: one all-day
+event per task that has a valid `dueDate` (strictly `YYYY-MM-DD`) and is not
+in the done column. Archived tasks are not included. Subscribe to it in any
+calendar app that accepts a URL.
+
+It is authenticated like every other route. Calendar apps cannot send headers,
+so wherever tokens are accepted (mode `token`, or `proxy` with tokens) the feed
+also takes the token as a query parameter:
+
+```text
+https://your-host.your-tailnet.ts.net:8443/api/calendar.ics?token=<token>
+```
+
+Use a dedicated *feed token* for this: entries in `[auth.feed_tokens]` open
+only that user's calendar feed, never the board. A URL token can leak via logs
+of proxies, browser history or a shared calendar setting; if it does, replace
+the hash in the config and nothing else is exposed. (The server itself never
+logs query strings.)
+
+Google Calendar ("Other calendars" > "From URL"):
+
+- The URL must be reachable from the public internet, so it needs Funnel (see
+  above) and a token; a tailnet-only address does not work.
+- Google refreshes subscribed calendars on its own schedule and it can take
+  many hours until changes show up; there is no way to force a refresh.
+- Google shows only events, which is why tasks are published as all-day
+  events rather than to-dos.
+
+Apps on a device in your tailnet (e.g. Apple Calendar, Thunderbird) can use the
+tailnet address directly; in proxy mode they are identified by
+`tailscale serve` and need no token.
+
 ## Security & Firewall Recommendations
 
 In the default mode TohdohBoard has no authentication. It is **highly recommended** to only run it within a trusted network like **Tailscale**, or to use proxy or token mode (above).
