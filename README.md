@@ -13,6 +13,14 @@ cargo run
 
 By default, the server runs on `0.0.0.0:3001` and is accessible across your Tailnet.
 
+## Documentation
+
+The source is documented with Rustdoc, including private items. Build and open the docs with:
+
+```bash
+cargo doc --no-deps --document-private-items --open
+```
+
 ## Security & Firewall Recommendations
 
 TohdohBoard does not have built-in authentication. It is **highly recommended** to only run it within a trusted network like **Tailscale**.
